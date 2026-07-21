@@ -323,7 +323,10 @@ def main():
             # Single year = height for exactly 1 year row
             p.height = 55 + 1 * 43
             # Re-set tracks for this year's data
-            p.set_tracks(tracks)
+            year_tracks = [
+                track for track in tracks if track.start_time_local.year == y
+            ]
+            p.set_tracks(year_tracks)
             # Use year-specific title if available, otherwise use default
             year_title = args.title if args.title else f"{y} Running"
             original_title = p.title
