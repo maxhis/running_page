@@ -20,6 +20,7 @@ from lxml import etree
 import aiofiles
 import garth
 import httpx
+import requests
 from config import FOLDER_DICT, JSON_FILE, SQL_FILE
 from garmin_device_adaptor import process_garmin_data
 from utils import make_activities_file
@@ -28,6 +29,12 @@ from utils import make_activities_file
 logger = logging.getLogger(__name__)
 
 TIME_OUT = httpx.Timeout(240.0, connect=360.0)
+GARTH_TIMEOUT = 30
+GARTH_RETRIES = 5
+GARTH_BACKOFF_FACTOR = 1.0
+MAX_RETRY_ATTEMPTS = 4
+RETRY_BASE_DELAY = 2.0
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 GARMIN_COM_URL_DICT = {
     "SSO_URL_ORIGIN": "https://sso.garmin.com",
     "SSO_URL": "https://sso.garmin.com/sso",
@@ -58,12 +65,19 @@ class Garmin:
             if auth_domain and str(auth_domain).upper() == "CN"
             else GARMIN_COM_URL_DICT
         )
+        garth_kwargs = {
+            "timeout": GARTH_TIMEOUT,
+            "retries": GARTH_RETRIES,
+            "backoff_factor": GARTH_BACKOFF_FACTOR,
+        }
         if auth_domain and str(auth_domain).upper() == "CN":
-            garth.configure(domain="garmin.cn", ssl_verify=False)
+            garth_kwargs["domain"] = "garmin.cn"
+            garth_kwargs["ssl_verify"] = False
+        garth.configure(**garth_kwargs)
         self.modern_url = self.URL_DICT.get("MODERN_URL")
         garth.client.loads(secret_string)
         if garth.client.oauth2_token.expired:
-            garth.client.refresh_oauth2()
+            self._refresh_oauth2()
 
         self.headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
@@ -75,31 +89,70 @@ class Garmin:
         self.upload_url = self.URL_DICT.get("UPLOAD_URL")
         self.activity_url = self.URL_DICT.get("ACTIVITY_URL")
 
+    def _refresh_oauth2(self):
+        last_err = None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                garth.client.refresh_oauth2()
+                return
+            except (requests.exceptions.RequestException, TimeoutError, OSError) as err:
+                last_err = err
+                if attempt == MAX_RETRY_ATTEMPTS:
+                    break
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(
+                    f"Garmin OAuth2 refresh failed (attempt {attempt}/{MAX_RETRY_ATTEMPTS}): {err}. "
+                    f"Retrying in {delay:.0f}s..."
+                )
+                time.sleep(delay)
+        raise GarminConnectConnectionError(
+            f"Failed to refresh Garmin OAuth2 token after {MAX_RETRY_ATTEMPTS} attempts: {last_err}"
+        ) from last_err
+
     async def fetch_data(self, url, retrying=False):
         """
         Fetch and return data
         """
-        try:
-            response = await self.req.get(url, headers=self.headers)
-            if response.status_code == 429:
-                raise GarminConnectTooManyRequestsError("Too many requests")
-            logger.debug(f"fetch_data got response code {response.status_code}")
-            response.raise_for_status()
-            return response.json()
-        except Exception as err:
-            print(err)
-            if retrying:
-                logger.debug(
-                    "Exception occurred during data retrieval, relogin without effect: %s"
-                    % err
+        max_attempts = 1 if retrying else MAX_RETRY_ATTEMPTS
+        last_err = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self.req.get(url, headers=self.headers)
+                if response.status_code == 401 and attempt < max_attempts:
+                    print("Garmin API returned 401, refreshing OAuth2 token...")
+                    await asyncio.to_thread(self._refresh_oauth2)
+                    self.headers["Authorization"] = str(garth.client.oauth2_token)
+                    continue
+                if response.status_code == 429:
+                    raise GarminConnectTooManyRequestsError("Too many requests")
+                logger.debug(f"fetch_data got response code {response.status_code}")
+                response.raise_for_status()
+                return response.json()
+            except (
+                httpx.HTTPError,
+                GarminConnectTooManyRequestsError,
+                TimeoutError,
+                OSError,
+            ) as err:
+                last_err = err
+                status_code = (
+                    err.response.status_code
+                    if isinstance(err, httpx.HTTPStatusError)
+                    else None
                 )
-                raise GarminConnectConnectionError("Error connecting") from err
-            else:
-                logger.debug(
-                    "Exception occurred during data retrieval - perhaps session expired - trying relogin: %s"
-                    % err
+                is_retryable = (
+                    status_code is None or status_code in RETRYABLE_STATUS_CODES
                 )
-                await self.fetch_data(url, retrying=True)
+                print(err)
+                if not is_retryable or attempt == max_attempts:
+                    logger.debug("Exception occurred during data retrieval: %s" % err)
+                    raise GarminConnectConnectionError("Error connecting") from err
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(
+                    f"Garmin request failed (attempt {attempt}/{max_attempts}), retrying in {delay:.0f}s..."
+                )
+                await asyncio.sleep(delay)
+        raise GarminConnectConnectionError("Error connecting") from last_err
 
     async def get_activities(self, start, limit):
         """
@@ -122,9 +175,35 @@ class Garmin:
         if file_type == "fit":
             url = f"{self.modern_url}/download-service/files/activity/{activity_id}"
         logger.info(f"Download activity from {url}")
-        response = await self.req.get(url, headers=self.headers)
-        response.raise_for_status()
-        return response.read()
+        last_err = None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                response = await self.req.get(url, headers=self.headers)
+                if response.status_code == 401 and attempt < MAX_RETRY_ATTEMPTS:
+                    await asyncio.to_thread(self._refresh_oauth2)
+                    self.headers["Authorization"] = str(garth.client.oauth2_token)
+                    continue
+                response.raise_for_status()
+                return response.read()
+            except (httpx.HTTPError, TimeoutError, OSError) as err:
+                last_err = err
+                status_code = (
+                    err.response.status_code
+                    if isinstance(err, httpx.HTTPStatusError)
+                    else None
+                )
+                if (
+                    status_code is not None
+                    and status_code not in RETRYABLE_STATUS_CODES
+                ) or attempt == MAX_RETRY_ATTEMPTS:
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(
+                    f"Download activity {activity_id} failed (attempt {attempt}/{MAX_RETRY_ATTEMPTS}): {err}. "
+                    f"Retrying in {delay:.0f}s..."
+                )
+                await asyncio.sleep(delay)
+        raise last_err
 
     async def upload_activities_original_from_strava(
         self, datas, use_fake_garmin_device=False
@@ -354,39 +433,43 @@ async def download_new_activities(
     secret_string, auth_domain, downloaded_ids, is_only_running, folder, file_type
 ):
     client = Garmin(secret_string, auth_domain, is_only_running)
-    # because I don't find a para for after time, so I use garmin-id as filename
-    # to find new run to generate
-    activity_ids = await get_activity_id_list(client)
-    to_generate_garmin_ids = list(set(activity_ids) - set(downloaded_ids))
-    print(f"{len(to_generate_garmin_ids)} new activities to be downloaded")
+    try:
+        # because I don't find a para for after time, so I use garmin-id as filename
+        # to find new run to generate
+        activity_ids = await get_activity_id_list(client)
+        to_generate_garmin_ids = list(set(activity_ids) - set(downloaded_ids))
+        print(f"{len(to_generate_garmin_ids)} new activities to be downloaded")
 
-    to_generate_garmin_id2title = {}
-    garmin_summary_infos_dict = {}
-    for id in to_generate_garmin_ids:
-        try:
-            activity_summary = await client.get_activity_summary(id)
-            activity_title = activity_summary.get("activityName", "")
-            to_generate_garmin_id2title[id] = activity_title
-            garmin_summary_infos_dict[id] = get_garmin_summary_infos(
-                activity_summary, id
-            )
-        except Exception as e:
-            print(f"Failed to get activity summary {id}: {str(e)}")
-            continue
+        to_generate_garmin_id2title = {}
+        garmin_summary_infos_dict = {}
+        for id in to_generate_garmin_ids:
+            try:
+                activity_summary = await client.get_activity_summary(id)
+                activity_title = activity_summary.get("activityName", "")
+                to_generate_garmin_id2title[id] = activity_title
+                garmin_summary_infos_dict[id] = get_garmin_summary_infos(
+                    activity_summary, id
+                )
+            except Exception as e:
+                print(f"Failed to get activity summary {id}: {str(e)}")
+                continue
 
-    start_time = time.time()
-    await gather_with_concurrency(
-        10,
-        [
-            download_garmin_data(
-                client, id, file_type=file_type, summary_infos=garmin_summary_infos_dict
-            )
-            for id in to_generate_garmin_ids
-        ],
-    )
-    print(f"Download finished. Elapsed {time.time()-start_time} seconds")
-
-    await client.req.aclose()
+        start_time = time.time()
+        await gather_with_concurrency(
+            10,
+            [
+                download_garmin_data(
+                    client,
+                    id,
+                    file_type=file_type,
+                    summary_infos=garmin_summary_infos_dict,
+                )
+                for id in to_generate_garmin_ids
+            ],
+        )
+        print(f"Download finished. Elapsed {time.time()-start_time} seconds")
+    finally:
+        await client.req.aclose()
     return to_generate_garmin_ids, to_generate_garmin_id2title
 
 
@@ -445,8 +528,7 @@ if __name__ == "__main__":
         # merge downloaded_ids:list
         downloaded_ids = list(set(downloaded_ids + downloaded_gpx_ids))
 
-    loop = asyncio.get_event_loop()
-    future = asyncio.ensure_future(
+    new_ids, id2title = asyncio.run(
         download_new_activities(
             secret_string,
             auth_domain,
@@ -456,8 +538,6 @@ if __name__ == "__main__":
             file_type,
         )
     )
-    loop.run_until_complete(future)
-    new_ids, id2title = future.result()
     # fit may contain gpx(maybe upload by user)
     if file_type == "fit":
         make_activities_file(

@@ -24,14 +24,45 @@ COROS_TYPE_DICT = {
 
 
 TIME_OUT = httpx.Timeout(240.0, connect=360.0)
+MAX_RETRY_ATTEMPTS = 4
+RETRY_BASE_DELAY = 2.0
+RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 
 
 class Coros:
     def __init__(self, account, password, is_only_running=False):
         self.account = account
         self.password = password
+        self.is_only_running = is_only_running
         self.headers = None
         self.req = None
+
+    async def _request_with_retry(self, client, method, url, **kwargs):
+        last_err = None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                response = await client.request(method, url, **kwargs)
+                response.raise_for_status()
+                return response
+            except (httpx.HTTPError, TimeoutError, OSError) as err:
+                last_err = err
+                status_code = (
+                    err.response.status_code
+                    if isinstance(err, httpx.HTTPStatusError)
+                    else None
+                )
+                if (
+                    status_code is not None
+                    and status_code not in RETRYABLE_STATUS_CODES
+                ) or attempt == MAX_RETRY_ATTEMPTS:
+                    raise
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                print(
+                    f"COROS request failed (attempt {attempt}/{MAX_RETRY_ATTEMPTS}): {err}. "
+                    f"Retrying in {delay:.0f}s..."
+                )
+                await asyncio.sleep(delay)
+        raise last_err
 
     async def login(self):
         url = COROS_URL_DICT.get("LOGIN_URL")
@@ -53,7 +84,9 @@ class Coros:
         }
         data = {"account": self.account, "accountType": 2, "pwd": self.password}
         async with httpx.AsyncClient(timeout=TIME_OUT) as client:
-            response = await client.post(url, json=data, headers=headers)
+            response = await self._request_with_retry(
+                client, "POST", url, json=data, headers=headers
+            )
             resp_json = response.json()
             access_token = resp_json.get("data", {}).get("accessToken")
             if not access_token:
@@ -64,9 +97,7 @@ class Coros:
                 "accesstoken": access_token,
                 "cookie": f"CPL-coros-region=2; CPL-coros-token={access_token}",
             }
-            self.is_only_running = is_only_running
             self.req = httpx.AsyncClient(timeout=TIME_OUT, headers=self.headers)
-        await client.aclose()
 
     async def init(self):
         await self.login()
@@ -78,7 +109,7 @@ class Coros:
         mode_list_str = "100,101,102,103" if only_run else ""
         while True:
             url = f"{COROS_URL_DICT.get('ACTIVITY_LIST')}?&modeList={mode_list_str}&pageNumber={page_number}&size=20"
-            response = await self.req.get(url)
+            response = await self._request_with_retry(self.req, "GET", url)
             data = response.json()
             activities = data.get("data", {}).get("dataList", None)
             if not activities:
@@ -108,32 +139,44 @@ class Coros:
         file_url = None
         fname = ""
         file_path = ""
-        try:
-            response = await self.req.post(download_url)
-            resp_json = response.json()
-            file_url = resp_json.get("data", {}).get("fileUrl")
-            if not file_url:
-                print(f"No file URL found for label_id {label_id}")
-                return None, None
+        for attempt in range(1, MAX_RETRY_ATTEMPTS + 1):
+            try:
+                response = await self._request_with_retry(
+                    self.req, "POST", download_url
+                )
+                resp_json = response.json()
+                file_url = resp_json.get("data", {}).get("fileUrl")
+                if not file_url:
+                    print(f"No file URL found for label_id {label_id}")
+                    return None, None
 
-            fname = os.path.basename(file_url)
-            file_path = os.path.join(download_folder, fname)
+                fname = os.path.basename(file_url)
+                file_path = os.path.join(download_folder, fname)
 
-            async with self.req.stream("GET", file_url) as response:
-                response.raise_for_status()
-                async with aiofiles.open(file_path, "wb") as f:
-                    async for chunk in response.aiter_bytes():
-                        await f.write(chunk)
-            return label_id, fname
-        except httpx.HTTPStatusError as exc:
+                async with self.req.stream("GET", file_url) as stream_resp:
+                    stream_resp.raise_for_status()
+                    async with aiofiles.open(file_path, "wb") as f:
+                        async for chunk in stream_resp.aiter_bytes():
+                            await f.write(chunk)
+                return label_id, fname
+            except httpx.HTTPStatusError as exc:
+                print(
+                    f"Failed to download {file_url} with status code {exc.response.status_code}: {exc}"
+                )
+                retryable = exc.response.status_code in RETRYABLE_STATUS_CODES
+            except Exception as exc:
+                print(f"Error occurred while downloading {file_url}: {exc}")
+                retryable = isinstance(exc, (httpx.HTTPError, TimeoutError, OSError))
+            if file_path and os.path.exists(file_path):
+                print(f"Delete the corrupted fit file: {fname}")
+                os.remove(file_path)
+            if not retryable or attempt == MAX_RETRY_ATTEMPTS:
+                break
+            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
             print(
-                f"Failed to download {file_url} with status code {response.status_code}: {exc}"
+                f"Retrying COROS download {label_id} (attempt {attempt}/{MAX_RETRY_ATTEMPTS}) in {delay:.0f}s..."
             )
-        except Exception as exc:
-            print(f"Error occurred while downloading {file_url}: {exc}")
-        if file_path and os.path.exists(file_path):
-            print(f"Delete the corrupted fit file: {fname}")
-            os.remove(file_path)
+            await asyncio.sleep(delay)
 
         return None, None
 
@@ -145,29 +188,32 @@ def get_downloaded_ids(folder):
 async def download_and_generate(account, password, only_run, file_type):
     folder = FOLDER_DICT[file_type]
     downloaded_ids = get_downloaded_ids(folder)
-    coros = Coros(account, password)
-    await coros.init()
-    activity_infos = await coros.fetch_activity_ids_types(only_run=only_run)
-    activity_ids = [i[0] for i in activity_infos]
-    activity_types = [i[1] for i in activity_infos]
-    activity_id_type_dict = dict(zip(activity_ids, activity_types))
-    print("activity_ids: ", len(activity_ids))
-    print("downloaded_ids: ", len(downloaded_ids))
-    to_generate_coros_ids = list(set(activity_ids) - set(downloaded_ids))
-    print("to_generate_activity_ids: ", len(to_generate_coros_ids))
+    coros = Coros(account, password, is_only_running=only_run)
+    try:
+        await coros.init()
+        activity_infos = await coros.fetch_activity_ids_types(only_run=only_run)
+        activity_ids = [i[0] for i in activity_infos]
+        activity_types = [i[1] for i in activity_infos]
+        activity_id_type_dict = dict(zip(activity_ids, activity_types))
+        print("activity_ids: ", len(activity_ids))
+        print("downloaded_ids: ", len(downloaded_ids))
+        to_generate_coros_ids = list(set(activity_ids) - set(downloaded_ids))
+        print("to_generate_activity_ids: ", len(to_generate_coros_ids))
 
-    start_time = time.time()
-    await gather_with_concurrency(
-        10,
-        [
-            coros.download_activity(
-                label_id, activity_id_type_dict[label_id], file_type
-            )
-            for label_id in to_generate_coros_ids
-        ],
-    )
-    print(f"Download finished. Elapsed {time.time()-start_time} seconds")
-    await coros.req.aclose()
+        start_time = time.time()
+        await gather_with_concurrency(
+            10,
+            [
+                coros.download_activity(
+                    label_id, activity_id_type_dict[label_id], file_type
+                )
+                for label_id in to_generate_coros_ids
+            ],
+        )
+        print(f"Download finished. Elapsed {time.time()-start_time} seconds")
+    finally:
+        if coros.req is not None:
+            await coros.req.aclose()
     make_activities_file(SQL_FILE, folder, JSON_FILE, file_type)
 
 
